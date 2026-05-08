@@ -20,7 +20,12 @@ object WeiBoKafkaConsumer {
     val spark = SparkSession.builder()
       .appName("WeiBoKafkaConsumer")
       .master("local[*]")
+      .enableHiveSupport()
+//      .config("spark.sql.catalogImplementation", "hive") //命名空间
+      .config("hive.metastore.uris", "thrift://master1:9083")
       .getOrCreate()
+
+    // 加载模型
     val model = WeiboFinalPipeline.trainModel(spark)
     import spark.implicits._
     var data = KafkaUtils.getKafkaStream(spark, Config.KAFKA_TOPIC)
@@ -31,20 +36,32 @@ object WeiBoKafkaConsumer {
     data = cleanText(data)
     data = cleanUserAuth(data)
     data = cleanInvalidText(spark, data, model)
-//val result = data
-//  .transform(dropColumns)
-//  .transform(cleanRemark)
-//  .transform(cleanText)
-//  .transform(cleanUserAuth)
-//  .transform(cleanInvalidText(_, model)) // 必须这样写！
 
-    data.writeStream
-      .format("console")   // 输出到控制台
-      .option("truncate", false)
+    // 将数据输入到处理
+    Classify.classByDayAndHour(spark, data)
+    // 统计  定时统计 10s一次
+    import java.util.{Timer, TimerTask}
+    val timer = new Timer(true)
+
+    timer.schedule(new TimerTask() {
+      override def run(): Unit = {
+        try {
+          println("开始定时统计10s一次")
+          Classify.classByIndicator(spark)
+        } catch {
+          case e: Exception =>
+            println("统计出错，跳过本次：" + e.getMessage)
+        }
+      }
+    }, 0, 60*1000*5) // 0秒后开始，每5min执行一次
+//    Classify.classByIndicator(spark)
+//    data.writeStream
+//      .format("console")   // 输出到控制台
+//      .option("truncate", false)
 //      .option("checkpointLocation", "./checkpoint/weibo")
-      .start()            // 启动流
-      .awaitTermination() // 持续运行
-
+//      .start()            // 启动流
+//      .awaitTermination() // 持续运行
+    spark.streams.awaitAnyTermination()
   }
 
   def dropColumns(data: DataFrame): DataFrame = {
@@ -69,11 +86,10 @@ object WeiBoKafkaConsumer {
             .otherwise(col("user_authentication")) as "user_authentication"
         )
     }
-  //TODO 对无效文本进行判断
-
+  //对无效文本进行判断
   def cleanInvalidText(spark: SparkSession, cleaned: DataFrame, model: PipelineModel):DataFrame = {
     // 特征工程
-    val featureDF = RuleFeatureBuilder.build(cleaned)
+    val featureDF = WeiboFinalPipeline.RuleFeatureBuilder.build(cleaned)
     // 分词
     val jiebaUDF = udf { text: String =>
       val seg = new com.huaban.analysis.jieba.JiebaSegmenter()
@@ -82,12 +98,11 @@ object WeiBoKafkaConsumer {
     }
     val wordsDF = featureDF.withColumn("words", jiebaUDF(col("text")))
     val result = model.transform(wordsDF)
-//    val cleanData = result.filter(col("prediction") === 1.0)
     val cleanData = result
-//      .filter(col("prediction") === 1.0)
+      .filter(col("prediction") === 1.0)
       // 保留原始列和预测列
-      .select((cleaned.columns :+ "prediction").map(col): _*)
-//      .select(cleaned.columns.map(col): _*)
+//      .select((cleaned.columns :+ "prediction").map(col): _*)
+      .select(cleaned.columns.map(col): _*)
     cleanData
   }
 
@@ -101,12 +116,14 @@ object WeiBoKafkaConsumer {
         .withColumn("text",
           regexp_replace(col("text"),
             "@\\S+", ""))
+        .filter(!col("text").contains("笔常识打卡"))
+        .filter(!col("text").contains("常识翻身打卡计划"))
         .filter(col("text").isNotNull)
         .filter(length(col("text")) > 5)
     }
 
   def cleanRemark(data: DataFrame): DataFrame = {
-    data.filter("reposts_count > 10 OR comments_count > 10 OR attitudes_count > 30")
+    data.filter("reposts_count > 1 OR comments_count > 1 OR attitudes_count > 5")
       .dropDuplicates("id")
   }
 

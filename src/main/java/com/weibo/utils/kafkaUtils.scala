@@ -21,8 +21,8 @@ object KafkaUtils {
       .format("kafka")
       .option("kafka.bootstrap.servers", Config.KAFKA_BOOTSTRAP)
       .option("subscribe", topic)
-      .option("startingOffsets", "latest")
-//      .option("startingOffsets","earliest") // 临时测试
+//      .option("startingOffsets", "latest")
+      .option("startingOffsets","earliest") // 临时测试
       .option("failOnDataLoss", "false")
 
       .load()

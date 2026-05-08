@@ -39,7 +39,7 @@ object RuleFeatureBuilder {
       // 推广的个数
       .withColumn("promotion_count",
         (length(col("text")) -
-          length(regexp_replace(col("text"), "关注我|私信|领取福利", ""))) / 3
+          length(regexp_replace(col("text"), "关注我|私信|领取福利|又好又便宜", ""))) / 4
       )
 
       // ========= 行为特征 =========
@@ -50,6 +50,14 @@ object RuleFeatureBuilder {
       // 互动度
       .withColumn("engagement_score",
         col("reposts_count") + col("comments_count") + col("attitudes_count"))
+
+      // 互动度（原始值）
+      .withColumn("engagement",
+        col("reposts_count") + col("comments_count") + col("attitudes_count"))
+
+      // 互动度比率
+      .withColumn("engagement_ratio",
+        (col("reposts_count") + col("comments_count") + col("attitudes_count")) / (length(col("text")) + 1))
 
       // ========= 强度特征 =========
       // 垃圾密度

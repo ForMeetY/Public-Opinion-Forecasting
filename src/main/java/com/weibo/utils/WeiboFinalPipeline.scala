@@ -52,7 +52,8 @@ object WeiboFinalPipeline {
       "text_length",
        "spam_keyword_count",
       "promotion_count", "is_viral", "engagement_score",
-      "spam_density", "promotion_density"
+      "spam_density", "promotion_density",
+      "engagement", "engagement_ratio"
     )
 
     val assembler = new VectorAssembler()
@@ -84,9 +85,11 @@ object WeiboFinalPipeline {
 //        .withColumn("has_at", when(col("text").contains("@"), 1).otherwise(0))
 //        .withColumn("has_repeat_char", when(col("text").rlike("(.)\\1{4,}"), 1).otherwise(0))
 //        .withColumn("has_spam_keyword", when(col("text").rlike("加V|抽奖|秒杀|代理|点击链接"), 1).otherwise(0))
-        .withColumn("spam_keyword_count", size(split(col("text"), "加V|抽奖|秒杀|代理|点击链接")))
+        .withColumn("spam_keyword_count", size(split(col("text"), "加V|抽奖|秒杀|代理|私信|领取|福利|红包|点击|下单|推广|包邮|免费|送|宝子|亲亲|抽|双11")))
 //        .withColumn("has_promotion", when(col("text").rlike("关注我|私信|领取福利"), 1).otherwise(0))
-        .withColumn("promotion_count", (length(col("text")) - length(regexp_replace(col("text"), "关注我|私信|领取福利", ""))) / 3)
+        .withColumn("engagement", col("reposts_count") + col("comments_count") + col("attitudes_count"))
+        .withColumn("engagement_ratio", col("engagement") / (length(col("text")) + 1))
+        .withColumn("promotion_count", (length(col("text")) - length(regexp_replace(col("text"), "关注|转发|评论|点赞|进店|抢购|优惠|又好又便宜", ""))) / 8)
         .withColumn("is_viral", when(col("reposts_count") > 1000, 1).otherwise(0))
         .withColumn("engagement_score", col("reposts_count") + col("comments_count") + col("attitudes_count"))
         .withColumn("spam_density", col("spam_keyword_count") / (length(col("text")) + 1))
