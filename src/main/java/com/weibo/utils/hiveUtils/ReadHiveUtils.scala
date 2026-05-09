@@ -8,9 +8,11 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  */
 object ReadHiveUtils {
 
+  // 要去重
   def readHiveclassByDayAndHour(spark: SparkSession,db:String,tableName:String): DataFrame = {
     println(s"正在读取表${db}.${tableName}")
-    val df = spark.sql(s"select * from ${db}.${tableName}")
+    // 去重
+    val df = spark.sql(s"select * from ${db}.${tableName}").dropDuplicates("dt", "id")
     df
   }
 
