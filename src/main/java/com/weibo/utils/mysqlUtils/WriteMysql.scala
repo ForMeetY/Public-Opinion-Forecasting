@@ -1,27 +1,25 @@
 package com.weibo.utils.mysqlUtils
-
-import org.apache.spark.sql.{DataFrame, SparkSession}
-
+import org.apache.spark.sql.DataFrame
 /**
  * @author Xbx
- * @date 2026/5/8 17:07
+ * @date 2026/5/9 14:17
  */
+// 写入mysql
 
-// 读取固定的表
-object ReadMysql {
+object WriteMysql {
   private val url = "jdbc:mysql://master1:3306/weibo?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai"
   private val user = "root"
   private val password = "1234"
-  def readTable(spark:SparkSession, tableName: String): DataFrame = {
-      spark.read
+  def writeTable(data:DataFrame, tableName:String): Unit = {
+    data.write
       .format("jdbc")
       .option("url", url)
-      .option("dbtable", tableName)
       .option("user", user)
       .option("password", password)
-      .load()
+      .option("dbtable", tableName)
+      .mode("overwrite")
+      .save()
+    println("写入成功")
+
   }
-
-
-
 }

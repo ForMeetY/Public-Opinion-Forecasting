@@ -46,7 +46,7 @@ object WeiBoKafkaConsumer {
     timer.schedule(new TimerTask() {
       override def run(): Unit = {
         try {
-          println("开始定时统计10s一次")
+          println("开始定时统计5min一次")
           Classify.classByIndicator(spark)
         } catch {
           case e: Exception =>
@@ -54,7 +54,6 @@ object WeiBoKafkaConsumer {
         }
       }
     }, 0, 60*1000*5) // 0秒后开始，每5min执行一次
-//    Classify.classByIndicator(spark)
 //    data.writeStream
 //      .format("console")   // 输出到控制台
 //      .option("truncate", false)
@@ -108,22 +107,23 @@ object WeiBoKafkaConsumer {
 
     def cleanText(data: DataFrame):DataFrame = {
       data
-        // 1. 去掉 #话题#
-//        .withColumn("text",
-//          regexp_replace(col("text"),
-//            "#[^#]+#", ""))
-        // 2. 去掉@用户
         .withColumn("text",
           regexp_replace(col("text"),
             "@\\S+", ""))
-        .filter(!col("text").contains("笔常识打卡"))
+        .filter(!col("text").contains("常识打卡"))
+        .filter(!col("text").contains("天猫"))
+        .filter(!col("text").contains("京东"))
+        .filter(!col("text").contains("淘宝"))
+        .filter(!col("text").contains("拼多多"))
+        .filter(!col("text").contains("肖战"))
+        .filter(!col("text").contains("杨紫"))
         .filter(!col("text").contains("常识翻身打卡计划"))
         .filter(col("text").isNotNull)
         .filter(length(col("text")) > 5)
     }
 
   def cleanRemark(data: DataFrame): DataFrame = {
-    data.filter("reposts_count > 1 OR comments_count > 1 OR attitudes_count > 5")
+    data.filter("reposts_count > 2 OR comments_count > 2 OR attitudes_count > 2")
       .dropDuplicates("id")
   }
 

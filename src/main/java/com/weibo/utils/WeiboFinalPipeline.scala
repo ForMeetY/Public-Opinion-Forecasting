@@ -14,7 +14,7 @@ object WeiboFinalPipeline {
     var df = spark.read.format("csv")
       .option("header", "true")
       .option("encoding","GBK")
-      .load("src/main/java/com/weibo/utils/data/data.csv")
+      .load("file:///E:/Java/weiboData/src/main/java/com/weibo/utils/data/data.csv")
     df = df.filter("label is not null AND label != ''")
 
 

@@ -35,7 +35,7 @@ object RuleFeatureBuilder {
         size(split(col("text"), "广告|加V|抽奖|秒杀|代理|点击链接")))
       // 是否包含推广
       .withColumn("has_promotion",
-        when(col("text").rlike("关注我|私信|领取福利"), 1).otherwise(0))
+        when(col("text").rlike("关注我|私信|领取福利|又好又便宜"), 1).otherwise(0))
       // 推广的个数
       .withColumn("promotion_count",
         (length(col("text")) -
