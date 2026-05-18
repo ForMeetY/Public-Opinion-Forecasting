@@ -1,5 +1,5 @@
 package com.weibo.utils.mysqlUtils
-import org.apache.spark.sql.{DataFrame, SaveMode}
+import org.apache.spark.sql.DataFrame
 /**
  * @author Xbx
  * @date 2026/5/9 14:17
@@ -17,8 +17,7 @@ object WriteMysql {
       .option("user", user)
       .option("password", password)
       .option("dbtable", tableName)
-      .mode(SaveMode.Overwrite)       // 覆盖模式
-      .option("truncate", "true")
+      .mode("overwrite")
       .save()
     println("写入成功")
 

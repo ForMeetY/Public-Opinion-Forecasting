@@ -1,11 +1,10 @@
 package com.weibo.etl
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import com.weibo.utils.{KafkaUtils, WeiboFinalPipeline}
+import com.weibo.utils.{KafkaUtils, RuleFeatureBuilder, WeiboFinalPipeline}
 import com.weibo.myconfig.Config
 import org.apache.spark.sql.functions.{col, length, regexp_replace, udf, when}
 import org.apache.spark.ml.PipelineModel
-import org.apache.spark.sql.types.IntegerType
 /**
  * @author Xbx
  * @date 2026/5/6 21:10
@@ -54,13 +53,20 @@ object WeiBoKafkaConsumer {
             println("统计出错，跳过本次：" + e.getMessage)
         }
       }
-    }, 0, 60*1000*6) // 0秒后开始，每6min执行一次
+    }, 0, 60*1000*5) // 0秒后开始，每5min执行一次
+//    data.writeStream
+//      .format("console")   // 输出到控制台
+//      .option("truncate", false)
+//      .option("checkpointLocation", "./checkpoint/weibo")
+//      .start()            // 启动流
+//      .awaitTermination() // 持续运行
     spark.streams.awaitAnyTermination()
   }
 
   def dropColumns(data: DataFrame): DataFrame = {
     data.drop(
       "article_url",
+      "location",
       "at_users",
       "pics",
       "video_url",
@@ -83,8 +89,14 @@ object WeiBoKafkaConsumer {
   def cleanInvalidText(spark: SparkSession, cleaned: DataFrame, model: PipelineModel):DataFrame = {
     // 特征工程
     val featureDF = WeiboFinalPipeline.RuleFeatureBuilder.build(cleaned)
-    val df = WeiboFinalPipeline.jieba(featureDF)
-    val result = model.transform(df)
+    // 分词
+    val jiebaUDF = udf { text: String =>
+      val seg = new com.huaban.analysis.jieba.JiebaSegmenter()
+      if (text == null || text.trim.isEmpty) Seq.empty[String]
+      else seg.sentenceProcess(text).toArray.filter(_ != null).map(_.toString).filter(_.length > 1).toSeq
+    }
+    val wordsDF = featureDF.withColumn("words", jiebaUDF(col("text")))
+    val result = model.transform(wordsDF)
     val cleanData = result
       .filter(col("prediction") === 1.0)
       // 保留原始列和预测列
@@ -110,18 +122,16 @@ object WeiBoKafkaConsumer {
         .filter(length(col("text")) > 5)
     }
 
-  // 处理互动度低的并转换数据类型为int
   def cleanRemark(data: DataFrame): DataFrame = {
-    data
-      .withColumn("reposts_count", col("reposts_count").cast(IntegerType))
-      .withColumn("comments_count", col("comments_count").cast(IntegerType))
-      .withColumn("attitudes_count", col("attitudes_count").cast(IntegerType))
-      .filter("reposts_count > 0 OR comments_count > 0 OR attitudes_count > 0")
+    data.filter("reposts_count > 2 OR comments_count > 2 OR attitudes_count > 2")
       .dropDuplicates("id")
-
-
   }
+
+
   // 观察数据后再决定怎么处理
+
   // 数据传输进下一组件 hive和mysql
+
+
 
 }
