@@ -19,6 +19,9 @@ import scala.collection.mutable.ListBuffer
 * */
 
 object Classify {
+
+  // 情感分析，每次去hive读取所有 label 为null的数据 调用接口分析情感
+
   // 计算数据写入hive
   def classByDayAndHour(spark: SparkSession, data: DataFrame): Unit = {
     println("进入方法classByDayAndHour")
@@ -41,17 +44,10 @@ object Classify {
           .withColumn("reposts_count", col("reposts_count").cast("int"))
           .withColumn("comments_count", col("comments_count").cast("int"))
           .withColumn("attitudes_count", col("attitudes_count").cast("int"))
-          .withColumn("label", lit(null).cast("string"))
-          .withColumn("label_id", lit(null).cast("int"))
-          .withColumn("score", lit(null).cast("double"))
-          .withColumn("confidence", lit(null).cast("double"))
         val finalDF = df2.select(
           "id","bid","user_id","screen_name","text","topics",
           "reposts_count","comments_count","attitudes_count",
-          "created_at","location","user_authentication",
-          "hour","time_period",
-          "label","label_id","score","confidence",
-          "dt"
+          "created_at","location","user_authentication", "hour","time_period" ,"dt"
         )
         finalDF.show()
         // 写入hive
@@ -62,28 +58,21 @@ object Classify {
             spark.sql(
               """
                 |CREATE TABLE IF NOT EXISTS weibo.classbydayandhour (
-                |    id                  STRING,
-                |    bid                 STRING,
-                |    user_id             STRING,
-                |    screen_name         STRING,
-                |    text                STRING,
-                |    topics              STRING,
-                |    reposts_count       INT,
-                |    comments_count      INT,
-                |    attitudes_count     INT,
-                |    created_at          TIMESTAMP,
-                |    location            STRING,
-                |    user_authentication STRING,
-                |    hour                INT,
-                |    time_period         STRING,
-                |    label               STRING,
-                |    label_id            INT,
-                |    score               DOUBLE,
-                |    confidence          DOUBLE
+                |   id                  STRING,
+                |   bid                 STRING,
+                |   user_id             STRING,
+                |   screen_name         STRING,
+                |   text                STRING,
+                |   topics              STRING,
+                |   reposts_count       INT,
+                |   comments_count      INT,
+                |   attitudes_count     INT,
+                |   created_at          TIMESTAMP,
+                |   location           STRING,
+                |   user_authentication STRING,
+                |   hour                INT,    -- 小时 0-23（你要的跨天统计用）
+                |   time_period         STRING  -- 深夜/早间/午间/下午/晚间
                 |)
-                |PARTITIONED BY (dt STRING)
-                |STORED AS PARQUET
-                |TBLPROPERTIES ("parquet.compression" = "snappy");
                 |PARTITIONED BY (dt STRING)      -- 按天分区
                 |STORED AS PARQUET;
                 |""".stripMargin
@@ -92,6 +81,13 @@ object Classify {
           finalDF.write.mode("append")
             .insertInto("weibo.classbydayandhour")
           spark.sql("MSCK REPAIR TABLE weibo.classbydayandhour")
+
+//          finalDF.write
+//            .mode("append")
+//            .partitionBy("dt")
+//            .format("hive")
+//            .saveAsTable("weibo.classbydayandhour")
+
           println("写入成功")
           ()
         } catch {
