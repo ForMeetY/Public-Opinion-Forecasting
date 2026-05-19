@@ -77,13 +77,13 @@
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-core_2.12</artifactId>
             <version>${spark.version}</version>
-<!--            <scope>provided</scope>-->
+            <!--            <scope>provided</scope>-->
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-sql_2.12</artifactId>
             <version>${spark.version}</version>
-<!--            <scope>provided</scope>-->
+            <!--            <scope>provided</scope>-->
         </dependency>
 
         <!-- Spark Kafka 连接器 -->
@@ -121,6 +121,26 @@
             <version>2.15.2</version>
         </dependency>
 
+        <!-- HTTP 客户端：Spark 调用 Python FastAPI 接口发送 POST 请求 -->
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpclient</artifactId>
+            <version>4.5.14</version>
+        </dependency>
+
+        <!-- JSON 解析：解析 FastAPI 返回的情感分析结果 -->
+        <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+            <version>20231013</version>
+        </dependency>
+
+        <!-- 增强版 JSON 解析：配合 jackson 稳定解析批量结果 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.module</groupId>
+            <artifactId>jackson-module-scala_2.12</artifactId>
+            <version>2.15.2</version>
+        </dependency>
 
         <!-- Redis 客户端 -->
         <dependency>

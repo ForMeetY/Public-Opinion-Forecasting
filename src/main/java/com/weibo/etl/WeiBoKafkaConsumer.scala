@@ -49,6 +49,7 @@ object WeiBoKafkaConsumer {
         try {
           println("开始定时统计5min一次")
           Classify.classByIndicator(spark)
+          Classify.incrementalSentimentAnalysis(spark)
         } catch {
           case e: Exception =>
             println("统计出错，跳过本次：" + e.getMessage)
@@ -116,7 +117,7 @@ object WeiBoKafkaConsumer {
       .withColumn("reposts_count", col("reposts_count").cast(IntegerType))
       .withColumn("comments_count", col("comments_count").cast(IntegerType))
       .withColumn("attitudes_count", col("attitudes_count").cast(IntegerType))
-      .filter("reposts_count > 0 OR comments_count > 0 OR attitudes_count > 0")
+      .filter("reposts_count = 0 OR comments_count = 0 OR attitudes_count = 0")
       .dropDuplicates("id")
 
 
