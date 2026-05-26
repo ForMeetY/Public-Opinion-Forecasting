@@ -48,14 +48,15 @@ object WeiBoKafkaConsumer {
       override def run(): Unit = {
         try {
           println("开始定时统计5min一次")
-          Classify.classByIndicator(spark)
           Classify.incrementalSentimentAnalysis(spark)
+          Classify.classByIndicator(spark)
+
         } catch {
           case e: Exception =>
             println("统计出错，跳过本次：" + e.getMessage)
         }
       }
-    }, 0, 60*1000*6) // 0秒后开始，每6min执行一次
+    }, 0, 60*1000*3) // 0秒后开始，每6min执行一次
     spark.streams.awaitAnyTermination()
   }
 

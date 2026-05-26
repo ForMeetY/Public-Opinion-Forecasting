@@ -46,6 +46,11 @@ object Classify {
 
     val count = needDF.count()
     println(s"待预测数据：$count 条")
+    // 如果待测数据小于 50条等下一批
+    if (count < 50){
+      println("待测数据过少，等待下一批")
+      return
+    }
 
     if (count == 0) {
       println("暂无新数据需要预测")
@@ -175,7 +180,7 @@ object Classify {
         }
       }
       .option("checkpointLocation", "./checkpoint/weibo")
-      .trigger(Trigger.ProcessingTime("60 seconds"))
+      .trigger(Trigger.ProcessingTime("180 seconds"))
       .start()
   }
 
@@ -303,13 +308,15 @@ object Classify {
     val interactionCountByLabel = preData
       .groupBy("label")
       .agg(
-      avg("reposts_count").alias("avg_repost"),
-      avg("comments_count").alias("avg_comment"),
-      avg("attitudes_count").alias("avg_attitude")
+        // 保留2位小数
+        round(avg("reposts_count"), 2).alias("avg_repost"),
+        round(avg("comments_count"), 2).alias("avg_comment"),
+        round(avg("attitudes_count"), 2).alias("avg_attitude")
       )
       .withColumn("create_time", lit(nowStr)) // 加统计时间
 
     interactionCountByLabel.show()
+
 
     // 地区综合情感热度（平均分 score）
     // 每个地区一个综合情感分数
@@ -324,7 +331,7 @@ object Classify {
         explode(split(col("location"), " \\| ")).as("region"),
         col("score")
       )
-      // 按地区分组 → 计算【综合平均分】+ 帖子数量
+      // 按地区分组 计算综合平均分+ 帖子数量
       .groupBy("region")
       .agg(
         avg("score").as("avg_score"),        // 综合情感分数
@@ -336,13 +343,8 @@ object Classify {
       .orderBy(desc("avg_score"))
       // 添加统计时间
       .withColumn("create_time", lit(nowStr))
-    // 打印查看结果
-    regionHeatStatistic.show()
-
-
 
     // 每日情感趋势 占比统计 无偏差
-
     //  先算每日各类情感数量
     val dayLabelCount = preData
       .filter(col("label").isNotNull && col("label") =!= "")
@@ -363,7 +365,7 @@ object Classify {
       .orderBy("dt")
 
     // 展示
-    dayLabelRatio.show()
+
 
     // 模型稳定性分析 模型置信度统计（模型效果展示）
     //-- 模型预测置信度区间分布
@@ -387,11 +389,12 @@ object Classify {
       .withColumn("create_time", lit(nowStr))
 
     // 打印查看
-    confidenceLevelCount.show()
+//    dayLabelRatio.show()
+//    confidenceLevelCount.show()
+//    regionHeatStatistic.show()
 
 
-
-//    regionHot.show()
+    //    regionHot.show()
 //    regionCount.show()
 //    userCount.show()
 //    timePeriodCount.show()
