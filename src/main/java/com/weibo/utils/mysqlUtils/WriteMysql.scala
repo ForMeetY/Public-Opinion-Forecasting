@@ -1,5 +1,6 @@
 package com.weibo.utils.mysqlUtils
 import org.apache.spark.sql.{DataFrame, SaveMode}
+import com.weibo.utils.Constant
 /**
  * @author Xbx
  * @date 2026/5/9 14:17
@@ -7,9 +8,9 @@ import org.apache.spark.sql.{DataFrame, SaveMode}
 // 写入mysql
 
 object WriteMysql {
-  private val url = "jdbc:mysql://master1:3306/weibo?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai"
-  private val user = "root"
-  private val password = "1234"
+  private val url = Constant.url
+  private val password = Constant.pwd
+  private val user = Constant.user
   def writeTable(data:DataFrame, tableName:String): Unit = {
     data.write
       .format("jdbc")
@@ -20,7 +21,7 @@ object WriteMysql {
       .mode(SaveMode.Overwrite)       // 覆盖模式
       .option("truncate", "true")
       .save()
-    println("写入成功")
+    println(tableName+"写入成功")
 
   }
 }
