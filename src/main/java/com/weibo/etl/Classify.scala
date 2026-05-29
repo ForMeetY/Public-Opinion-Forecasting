@@ -7,7 +7,7 @@ import com.weibo.utils.hiveUtils.{HiveTableExists, ReadHiveUtils}
 import org.apache.spark.sql.streaming.Trigger
 import com.weibo.utils.mysqlUtils.WriteMysql
 import com.weibo.utils.Api.CallBatchApi
-import com.weibo.utils.CheckpointUtils
+
 
 /**
  * @author Xbx
@@ -43,30 +43,23 @@ object Classify {
 
     val count = needDF.count()
     println(s"待预测数据：$count 条")
+    if (count == 0) {
+      println("暂无新数据需要预测")
+      return
+    }
     // 如果待测数据小于 50条等下一批
     if (count < 50){
       println("待测数据过少，等待下一批")
       return
     }
 
-    if (count == 0) {
-      println("暂无新数据需要预测")
-      return
-    }
-
-    // 批量调用接口
-//    val rows = needDF.collectAsList().asScala.toList
-//    val texts = rows.map(_.getAs[String]("text"))
-//
-//    // 调用 BatchApi 工具类
-//    val resultMap = CallBatchApi.batchSentimentPredict(texts)
 
 
+    // 调用接口
     val rows = needDF.collectAsList().asScala.toList
     val texts = rows.map(_.getAs[String]("text"))
     val resultMap = CallBatchApi.batchSentimentPredict(texts)
 
-    // 【核心修改】拼接结果：把 user_id 和 screen_name 统统带进去
     val writeDF = rows.map { row =>
       val text = row.getAs[String]("text")
       val (label, labelId, score, confidence) = resultMap(text)
@@ -104,11 +97,8 @@ object Classify {
     writeDF.write
       .mode("append")
       .insertInto("weibo.predstatistic")
-
     println(s"全新情感预测数据流写入完成！共写入 $count 条")
-
     // 后续我们再将统计结果写入 mysql
-
   }
 
   // 计算数据写入hive
@@ -200,7 +190,7 @@ object Classify {
       println("表不存在")
       return
     }
-    val data = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "classbydayandhour")
+    val data = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "classbydayandhour").cache()
 
     // 获取当前时间
     val now = java.time.LocalDateTime.now()
@@ -225,7 +215,9 @@ object Classify {
     // 统计各个地区的数量 间接得到热度
     import org.apache.spark.sql.functions._
 
-    // 统计地区热度（拆分 | 分隔的多地区 → 单独统计）
+
+    // 对regionCount的每个数值做
+    // 计算最大、最小值
     val regionCount = data
       .filter(col("location").isNotNull && col("location") =!= "")
       .select(explode(split(col("location"), " \\| ")).as("region"))
@@ -233,23 +225,17 @@ object Classify {
       .groupBy("region")
       .count()
       .orderBy(desc("count"))
-
-    // 对regionCount的每个数值做
-    // 计算最大、最小值
-    val minMax = regionCount.agg(min("count").as("min"), max("count").as("max")).head()
-    val minCount = minMax.getLong(0)
-    val maxCount = minMax.getLong(1)
-    // 3. 把 count 归一化到 0~100 热度
-    val regionHot = regionCount
-      .withColumn(
-        "hot",
-        round(
-          (col("count") - minCount) / (maxCount - minCount) * 100,
-          2
-        )
-      )
-      .orderBy(desc("hot"))
       .withColumn("create_time", lit(nowStr))
+
+    // 写入 MySQL
+    WriteMysql.writeTable(userCount, "user_post_count")
+    WriteMysql.writeTable(timePeriodCount, "time_period_count")
+    WriteMysql.writeTable(timeHourCount, "hour_post_count")
+    WriteMysql.writeTable(timeSeriesCount, "day_post_count")
+    WriteMysql.writeTable(timePeriodUserCount, "time_period_user_count")
+    WriteMysql.writeTable(regionCount, "regionHot")
+    data.unpersist()
+
 
     // 情感统计
     println("情感统计")
@@ -259,8 +245,8 @@ object Classify {
       println("表不存在")
       return
     }
-    val preData = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "predstatistic")
-    if (preData.isEmpty){
+    val preData = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "predstatistic").cache()
+    if (preData.head(1).isEmpty){
       println("预测表为空")
       return
     }
@@ -455,11 +441,10 @@ object Classify {
       .withColumn("create_time", lit(nowStr))
       .na.fill(0.0, Seq("hourly_sentiment_stddev")) // 防止单条发帖算不出标准差报 NaN
 
-    // 写入 MySQL
-    WriteMysql.writeTable(userTimeProfileDF, "user_time_sentiment_profile")
 
 
-    // ------------------ 2. 用户地域关注与情绪投射画像表 ------------------
+
+    // 用户地域关注与情绪投射画像表
     // 多标签炸开：处理一发多地的情况
     val explodedUserRegionDF = preData
       .filter(col("location").isNotNull && col("location") =!= "")
@@ -499,8 +484,7 @@ object Classify {
       .join(regionDiversityDF, Seq("user_id"), "left")
       .withColumn("create_time", lit(nowStr))
 
-    // 写入 MySQL
-    WriteMysql.writeTable(userRegionProfileDF, "user_region_sentiment_profile")
+
 
 
     // ------------------ 3. 用户身份特征与传播情绪特质画像表 ------------------
@@ -526,17 +510,15 @@ object Classify {
       )
       .withColumn("create_time", lit(nowStr))
 
-    // 写入 MySQL
+
     WriteMysql.writeTable(userAuthProfileDF, "user_auth_sentiment_profile")
+    WriteMysql.writeTable(userRegionProfileDF, "user_region_sentiment_profile")
+    WriteMysql.writeTable(userTimeProfileDF, "user_time_sentiment_profile")
     println("用户画像核心指标全部顺利写入 MySQL！")
-    WriteMysql.writeTable(userCount, "user_post_count")
-    WriteMysql.writeTable(timePeriodCount, "time_period_count")
-    WriteMysql.writeTable(timeHourCount, "hour_post_count")
-    WriteMysql.writeTable(timeSeriesCount, "day_post_count")
-    WriteMysql.writeTable(timePeriodUserCount, "time_period_user_count")
-    WriteMysql.writeTable(regionHot, "regionHot")
+
 
     // 情感数据
+
     WriteMysql.writeTable(labelCount, "label_count")
     WriteMysql.writeTable(labelCountByTime, "label_count_by_time")
     WriteMysql.writeTable(labelCountByUser, "user_auth_label_count")
@@ -545,5 +527,8 @@ object Classify {
     WriteMysql.writeTable(dayLabelRatio, "day_label_ratio")
     WriteMysql.writeTable(confidenceLevelCount, "confidence_level_count")
     println("Mysql 写入完成")
+    // 释放资源
+    preData.unpersist()
+
   }
 }
