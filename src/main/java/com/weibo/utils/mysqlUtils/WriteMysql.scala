@@ -25,7 +25,7 @@ object WriteMysql {
     println(s"$tableName 写入成功 mode=$mode")
   }
 
-  // ① 全量覆盖：清空表再写（全量重算 / 首次初始化用）
+  // 全量覆盖：清空表再写（全量重算 首次初始化用）
   def writeTable(data: DataFrame, tableName: String): Unit = {
     data.write
       .format("jdbc")

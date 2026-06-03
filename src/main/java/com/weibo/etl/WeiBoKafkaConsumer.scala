@@ -1,11 +1,16 @@
 package com.weibo.etl
 
+import java.time.LocalTime
+
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import com.weibo.utils.{KafkaUtils, WeiboFinalPipeline}
+import com.weibo.utils.{Constant, KafkaUtils, WeiboFinalPipeline}
 import com.weibo.myconfig.Config
 import org.apache.spark.sql.functions.{col, length, regexp_replace, udf, when}
 import org.apache.spark.ml.PipelineModel
 import org.apache.spark.sql.types.IntegerType
+import java.util.{Timer, TimerTask}
+import java.time.LocalTime
+import java.time.LocalDate
 /**
  * @author Xbx
  * @date 2026/5/6 21:10
@@ -40,9 +45,50 @@ object WeiBoKafkaConsumer {
 
     // 将数据输入到处理
     Classify.classByDayAndHour(spark, data)
+
     // 统计  定时统计 10s一次
     import java.util.{Timer, TimerTask}
     val timer = new Timer(true)
+    // 状态护栏：记录今天是否已经执行过夜间全量画像刷新
+    var lastRefreshDate: LocalDate = LocalDate.MIN
+    timer.schedule(new TimerTask() {
+      override def run(): Unit = {
+        try {
+          val nowTime = LocalTime.now()
+          val today = LocalDate.now()
+
+          println(s"时间: ${nowTime.toString.take(8)} | 开始执行每5分钟常规统计...")
+
+          //
+
+          // 判断当前是否处于 23:00 到 23:59 之间
+          val startTimeBoundary = LocalTime.of(Constant.startHour, Constant.startMin)
+          val endTimeBoundary = LocalTime.of(Constant.endHour, Constant.endMin)
+
+          if (nowTime.isAfter(startTimeBoundary) && nowTime.isBefore(endTimeBoundary)) {
+            // 只全量重刷一次，防止每5分钟都重刷
+            if (lastRefreshDate != today) {
+              println(s"启动全量老用户画像")
+
+              // 执行全量画像重刷
+              Classify.fullUserPortrait(spark)
+
+              // 锁死状态，今天不再重复执行
+              lastRefreshDate = today
+              println(s"今天 (${today}) 的夜间全量画像校准已顺利完成，状态锁已关闭。")
+            } else {
+              println("当前处于夜间时间段，但今晚全量画像已重刷过，跳过重刷。")
+            }
+          }
+
+        } catch {
+          case e: Exception =>
+            println("本次统计出错，已自动跳过，等待下一个5分钟。错误详情：")
+            e.printStackTrace()
+        }
+      }
+    }, 0, 1000 * 60 * 25) // 0秒后开始，每25分钟执行一次
+
 
     timer.schedule(new TimerTask() {
       override def run(): Unit = {
