@@ -2,7 +2,7 @@ package com.weibo.etl
 
 
 import java.time.{LocalDate, LocalTime}
-import java.util.TimerTask
+
 
 import org.apache.spark.sql.functions.{avg, col, count, date_format, desc, explode, hour, lit, round, split, sum, to_timestamp, when}
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -18,13 +18,109 @@ import com.weibo.utils.Constant
  */
 /*
 * 对数据进行分类 边分边写入hive
+*
 * */
 
 object Classify {
 
-  // 用户画像分析 创建用户画像表，以用户id为键 每次预测对比画像表和原表 只预测新加入的用户
+  /// 微博 分类
+  // 话题分类，增量判断只预测新数据
+  def incrementalTopicClassify(spark: SparkSession): Unit = {
+    import spark.implicits._
+    import scala.collection.JavaConverters._
 
+    println("正在执行：增量话题分类")
 
+    spark.sql("SET hive.exec.dynamic.partition = true")
+    spark.sql("SET hive.exec.dynamic.partition.mode = nonstrict")
+
+    // 读取指定日期的原始微博表
+    val rawDF = ReadHiveUtils.readHiveBySpecifiedDay(spark, "weibo", "classbydayandhour", Constant.time)
+
+    // 读取已分类表，取 id 用于增量去重
+    val classifiedDF = if (HiveTableExists.tableExists(spark, "weibo", "topic_classify")) {
+      spark.table("weibo.topic_classify").select("id")
+    } else {
+      // 表不存在时建表
+      spark.sql(
+        """
+          |CREATE TABLE IF NOT EXISTS weibo.topic_classify (
+          |    id                  STRING,
+          |    bid                 STRING,
+          |    user_id             STRING,
+          |    screen_name         STRING,
+          |    text                STRING,
+          |    topic_label         STRING,
+          |    topic_id            INT,
+          |    confidence          DOUBLE,
+          |    created_at          TIMESTAMP,
+          |    location            STRING,
+          |    user_authentication STRING,
+          |    hour                INT,
+          |    time_period         STRING,
+          |    tags_generated_at   TIMESTAMP
+          |)
+          |PARTITIONED BY (dt STRING)
+          |STORED AS PARQUET
+          |TBLPROPERTIES ("parquet.compression" = "snappy")
+          |""".stripMargin
+      )
+      // 建完表后返回空 DF
+      spark.table("weibo.topic_classify").select("id")
+    }
+
+    // 增量过滤：left_anti join 只查没分类过的
+    val needDF = rawDF
+      .join(classifiedDF, Seq("id"), "left_anti")
+      .filter(col("text").isNotNull && col("text") =!= "")
+
+    val count = needDF.count()
+    println(s"待分类数据：$count 条")
+    if (count == 0) {
+      println("暂无新数据需要分类")
+      return
+    }
+
+    // 调用话题分类接口
+    val rows = needDF.collectAsList().asScala.toList
+    val texts = rows.map(_.getAs[String]("text"))
+    val resultMap = CallBatchApi.batchTopicPredict(texts)
+
+    val nowTs = java.sql.Timestamp.valueOf(java.time.LocalDateTime.now())
+
+    val writeDF = rows.map { row =>
+      val text = row.getAs[String]("text")
+      val (label, labelId, confidence) = resultMap(text)
+      (
+        row.getAs[String]("id"),
+        row.getAs[String]("bid"),
+        row.getAs[String]("user_id"),
+        row.getAs[String]("screen_name"),
+        text,
+        label,
+        labelId,
+        confidence,
+        row.getAs[java.sql.Timestamp]("created_at"),
+        row.getAs[String]("location"),
+        row.getAs[String]("user_authentication"),
+        row.getAs[Int]("hour"),
+        row.getAs[String]("time_period"),
+        nowTs,
+        row.getAs[String]("dt")
+      )
+    }.toDF(
+      "id", "bid", "user_id", "screen_name", "text",
+      "topic_label", "topic_id", "confidence",
+      "created_at", "location", "user_authentication",
+      "hour", "time_period", "tags_generated_at", "dt"
+    )
+
+    writeDF.write
+      .mode("append")
+      .insertInto("weibo.topic_classify")
+
+    println(s"话题分类写入完成，共写入 $count 条")
+  }
 
 
   // 历史用户画像更新，每天晚上0点执行 对用户画像进行一轮更新
@@ -37,7 +133,6 @@ object Classify {
   def incrementalSentimentAnalysis(spark: SparkSession): Unit = {
     import spark.implicits._
     import scala.collection.JavaConverters._
-//    println(s"【DEBUG 强制打印】Constant.time 实际值 = ${Constant.time}")
     println("正在执行：增量情感分析")
 
     // 开启动态分区
@@ -67,9 +162,6 @@ object Classify {
 //      println("待测数据过少，等待下一批")
 //      return
 //    }
-
-
-
     // 调用接口
     val rows = needDF.collectAsList().asScala.toList
     val texts = rows.map(_.getAs[String]("text"))
@@ -143,7 +235,8 @@ object Classify {
           "reposts_count","comments_count","attitudes_count",
           "created_at","location","user_authentication", "hour","time_period" ,"dt"
         )
-        finalDF.show()
+
+
         // 写入hive
         try {
           println("写入hive")
@@ -190,7 +283,7 @@ object Classify {
         }
       }
       .option("checkpointLocation", "./checkpoint/weibo")
-      .trigger(Trigger.ProcessingTime("200 seconds"))
+      .trigger(Trigger.ProcessingTime("220 seconds"))
       .start()
   }
 
@@ -205,7 +298,8 @@ object Classify {
       println("表不存在")
       return
     }
-    val data = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "classbydayandhour").cache()
+    val data = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "classbydayandhour")
+    data.localCheckpoint()
 
     // 获取当前时间
     val now = java.time.LocalDateTime.now()
@@ -260,7 +354,8 @@ object Classify {
       println("表不存在")
       return
     }
-    val preData = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "predstatistic").cache()
+    val preData = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "predstatistic")
+    preData.localCheckpoint()
     if (preData.head(1).isEmpty){
       println("预测表为空")
       return
@@ -276,7 +371,7 @@ object Classify {
         try {
           val nowTime = LocalTime.now()
           val today = LocalDate.now()
-          println(s"时间: ${nowTime.toString.take(8)} | 开始执行每5分钟常规统计...")
+          println(s"时间: ${nowTime.toString.take(8)} | 开始执行每10分钟常规统计...")
           // 判断当前是否处于 23:00 到 23:59 之间
           val startTimeBoundary = LocalTime.of(Constant.startHour, Constant.startMin)
           val endTimeBoundary = LocalTime.of(Constant.endHour, Constant.endMin)
@@ -302,8 +397,6 @@ object Classify {
     preData.unpersist()
 
   }
-
-
 
 
 
@@ -343,7 +436,6 @@ object Classify {
       .count()
       .withColumnRenamed("count", "value")
       .withColumn("create_time", lit(nowStr)) // 加统计时间
-    labelCountByUser.show()
 
     //帖子热度（转评赞）与情感关联
     //-- 不同情感的平均转发/评论/点赞
@@ -362,8 +454,6 @@ object Classify {
         round(avg("attitudes_count"), 2).alias("avg_attitude")
       )
       .withColumn("create_time", lit(nowStr)) // 加统计时间
-
-    interactionCountByLabel.show()
 
 
     // 地区综合情感热度（平均分 score）
@@ -593,6 +683,4 @@ object Classify {
         WriteMysql.writeTable(userTimeProfileDF, "user_time_sentiment_profile")
         println("用户画像核心指标全部顺利写入 MySQL！")
   }
-
-
 }

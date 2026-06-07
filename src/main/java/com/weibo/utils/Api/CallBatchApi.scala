@@ -107,4 +107,41 @@ object CallBatchApi {
     resultMap.toMap
   }
 
+
+  def batchTopicPredict(texts: List[String]): Map[String, (String, Int, Double)] = {
+    val apiUrl = "http://127.0.0.1:8001/predict"  // 你的分类模型接口端口，注意别和情感接口8000冲突
+    val httpClient = HttpClients.createDefault()
+    val httpPost = new HttpPost(apiUrl)
+    httpPost.setHeader("Content-Type", "application/json;charset=UTF-8")
+
+    // 构造请求体 {"texts": ["文本1","文本2"]}
+    val reqJson = new JSONObject()
+    val textArr = new JSONArray()
+    texts.foreach(textArr.put)
+    reqJson.put("texts", textArr)
+
+    val entity = new StringEntity(reqJson.toString, "UTF-8")
+    httpPost.setEntity(entity)
+
+    // 发送请求
+    val response = httpClient.execute(httpPost)
+    val respStr = EntityUtils.toString(response.getEntity, "UTF-8")
+    httpClient.close()
+
+    // 解析返回结果
+    val respJson = new JSONObject(respStr)
+    val resultArr: JSONArray = respJson.getJSONArray("results")
+    val resultMap = mutable.HashMap[String, (String, Int, Double)]()
+
+    for (i <- 0 until resultArr.length()) {
+      val item = resultArr.getJSONObject(i)
+      val srcText   = texts(i)
+      val label     = item.getString("label")
+      val labelId   = item.getInt("label_id")
+      val confidence = item.getDouble("confidence")
+      resultMap.put(srcText, (label, labelId, confidence))
+    }
+    resultMap.toMap
+  }
+
 }
