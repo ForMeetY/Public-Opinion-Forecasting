@@ -12,10 +12,11 @@ object Constant {
   final val user = "root"
   final val pwd = "1234"
   // 当前时间  格式 "yyyy-MM-dd"
-  val now = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+  private val today: LocalDate = LocalDate.now()
+  val now: String = today.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
 
-  // 时间  "2026-06-02" 主要控制读取Hive的日期
-  final val time = "2026-05-04"
+  // 3. 今天 - n 天 = n天前
+  final val time: String = today.minusDays(2).format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
 
   // 控制用户画像的统计时间
   final val startHour = 23

@@ -39,12 +39,12 @@ object WriteMysql {
     println(s"$tableName 全量覆盖写入成功")
   }
 
-  // ② 追加写入：直接 append（历史数据补录，MySQL 表有 UNIQUE KEY 会报错，需配合 upsert）
+  // 追加写入：直接 append（历史数据补录，MySQL 表有 UNIQUE KEY 会报错，需配合 upsert）
   def appendTable(data: DataFrame, tableName: String): Unit = {
     write(data, tableName, SaveMode.Append)
   }
 
-  // ③ Upsert：有则更新无则插入（增量 / 补录推荐用这个，幂等安全）
+  // Upsert：有则更新无则插入（增量 / 补录推荐用这个，幂等安全）
   // Spark JDBC 本身不支持 upsert，通过先写临时表再执行 INSERT ... ON DUPLICATE KEY UPDATE 实现
   def upsertTable(data: DataFrame, tableName: String, uniqueKeys: Seq[String]): Unit = {
     val tmpTable = s"${tableName}_tmp_${System.currentTimeMillis()}"

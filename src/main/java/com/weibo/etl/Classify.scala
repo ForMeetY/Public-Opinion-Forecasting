@@ -1,47 +1,39 @@
 package com.weibo.etl
 
-
 import java.time.{LocalDate, LocalTime}
 
-
-import org.apache.spark.sql.functions.{avg, col, count, date_format, desc, explode, hour, lit, round, split, sum, to_timestamp, when}
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions.{max,asc, avg, col, count, countDistinct, date_format, desc, explode, first, hour, lit, round, row_number, split, stddev_samp, sum, when}
+import org.apache.spark.sql.{DataFrame, SparkSession, functions}
 import com.weibo.utils.hiveUtils.{HiveTableExists, ReadHiveUtils}
 import org.apache.spark.sql.streaming.Trigger
 import com.weibo.utils.mysqlUtils.WriteMysql
 import com.weibo.utils.Api.CallBatchApi
 import com.weibo.etl.userPortrait.UserPortrait
 import com.weibo.utils.Constant
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.storage.StorageLevel
+
 /**
  * @author Xbx
  * @date 2026/5/7 22:39
  */
-/*
-* 对数据进行分类 边分边写入hive
-*
-* */
-
 object Classify {
 
-  /// 微博 分类
-  // 话题分类，增量判断只预测新数据
+
+  // 微博话题分类（增量）
   def incrementalTopicClassify(spark: SparkSession): Unit = {
     import spark.implicits._
-    import scala.collection.JavaConverters._
 
     println("正在执行：增量话题分类")
 
     spark.sql("SET hive.exec.dynamic.partition = true")
     spark.sql("SET hive.exec.dynamic.partition.mode = nonstrict")
 
-    // 读取指定日期的原始微博表
     val rawDF = ReadHiveUtils.readHiveBySpecifiedDay(spark, "weibo", "classbydayandhour", Constant.time)
 
-    // 读取已分类表，取 id 用于增量去重
     val classifiedDF = if (HiveTableExists.tableExists(spark, "weibo", "topic_classify")) {
       spark.table("weibo.topic_classify").select("id")
     } else {
-      // 表不存在时建表
       spark.sql(
         """
           |CREATE TABLE IF NOT EXISTS weibo.topic_classify (
@@ -65,30 +57,33 @@ object Classify {
           |TBLPROPERTIES ("parquet.compression" = "snappy")
           |""".stripMargin
       )
-      // 建完表后返回空 DF
       spark.table("weibo.topic_classify").select("id")
     }
 
-    // 增量过滤：left_anti join 只查没分类过的
+    // 只保留需要的列，减少 collect 时的传输量
     val needDF = rawDF
       .join(classifiedDF, Seq("id"), "left_anti")
       .filter(col("text").isNotNull && col("text") =!= "")
+      .select(
+        "id", "bid", "user_id", "screen_name", "text",
+        "created_at", "location", "user_authentication",
+        "hour", "time_period", "dt"
+      ).cache()
 
-    val count = needDF.count()
-    println(s"待分类数据：$count 条")
-    if (count == 0) {
-      println("暂无新数据需要分类")
-      return
-    }
+    val cnt = needDF.count()
+    println(s"待分类数据：$cnt 条")
+    if (cnt == 0) { println("暂无新数据需要分类"); return }
 
-    // 调用话题分类接口
-    val rows = needDF.collectAsList().asScala.toList
-    val texts = rows.map(_.getAs[String]("text"))
+    // collect 前先 repartition 到合理分区数，避免单 Driver OOM
+    val rows = needDF.repartition(10).collectAsList()
+    import scala.collection.JavaConverters._
+    val rowsScala = rows.asScala.toList
+    val texts = rowsScala.map(_.getAs[String]("text"))
     val resultMap = CallBatchApi.batchTopicPredict(texts)
 
     val nowTs = java.sql.Timestamp.valueOf(java.time.LocalDateTime.now())
 
-    val writeDF = rows.map { row =>
+    val writeDF = rowsScala.map { row =>
       val text = row.getAs[String]("text")
       val (label, labelId, confidence) = resultMap(text)
       (
@@ -96,10 +91,7 @@ object Classify {
         row.getAs[String]("bid"),
         row.getAs[String]("user_id"),
         row.getAs[String]("screen_name"),
-        text,
-        label,
-        labelId,
-        confidence,
+        text, label, labelId, confidence,
         row.getAs[java.sql.Timestamp]("created_at"),
         row.getAs[String]("location"),
         row.getAs[String]("user_authentication"),
@@ -115,67 +107,60 @@ object Classify {
       "hour", "time_period", "tags_generated_at", "dt"
     )
 
-    writeDF.write
-      .mode("append")
-      .insertInto("weibo.topic_classify")
-
-    println(s"话题分类写入完成，共写入 $count 条")
+    writeDF.write.mode("append").insertInto("weibo.topic_classify")
+    println(s"话题分类写入完成，共写入 $cnt 条")
   }
 
 
-  // 历史用户画像更新，每天晚上0点执行 对用户画像进行一轮更新
+  // 全量用户画像刷新
+
   def fullUserPortrait(spark: SparkSession): Unit = {
     UserPortrait.fullUserProfile(spark)
   }
 
 
-  // 情感分析，每次去hive读取所有统计数据 再与预测表左连接找到没有统计过的 调用接口分析情感
+  // 情感分析（增量）
   def incrementalSentimentAnalysis(spark: SparkSession): Unit = {
     import spark.implicits._
     import scala.collection.JavaConverters._
     println("正在执行：增量情感分析")
 
-    // 开启动态分区
     spark.sql("SET hive.exec.dynamic.partition = true")
     spark.sql("SET hive.exec.dynamic.partition.mode = nonstrict")
 
-    // 读取 原始微博表（自带去重）
-//    val rawDF = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "classbydayandhour")
-    // 读取指定日期的
-    val rawDF = ReadHiveUtils.readHiveBySpecifiedDay(spark, "weibo", "classbydayandhour", Constant.time)
-    // 读取已预测表
+    val rawDF = ReadHiveUtils
+      .readHiveBySpecifiedDay(spark, "weibo", "classbydayandhour", Constant.time)
     val predDF = spark.table("weibo.predstatistic").select("id")
 
-    // 增量过滤：left_anti join  只查没预测过的数据
+    // 只 select 后续需要的列，不拉全表
     val needDF = rawDF
       .join(predDF, Seq("id"), "left_anti")
       .filter(col("text").isNotNull && col("text") =!= "")
+      .select(
+        "id", "bid", "user_id", "screen_name", "text", "topics",
+        "reposts_count", "comments_count", "attitudes_count",
+        "created_at", "location", "user_authentication",
+        "hour", "time_period", "dt"
+      ).cache()
 
-    val count = needDF.count()
-    println(s"待预测数据：$count 条")
-    if (count == 0) {
-      println("暂无新数据需要预测")
-      return
-    }
-    // 如果待测数据小于 50条等下一批
-//    if (count < 50){
-//      println("待测数据过少，等待下一批")
-//      return
-//    }
-    // 调用接口
-    val rows = needDF.collectAsList().asScala.toList
+    val cnt = needDF.count()
+    println(s"待预测数据：$cnt 条")
+    if (cnt == 0) { println("暂无新数据需要预测"); return }
+
+    val rows = needDF.repartition(10).collectAsList().asScala.toList
     val texts = rows.map(_.getAs[String]("text"))
     val resultMap = CallBatchApi.batchSentimentPredict(texts)
+
+    needDF.unpersist()
 
     val writeDF = rows.map { row =>
       val text = row.getAs[String]("text")
       val (label, labelId, score, confidence) = resultMap(text)
-
       (
         row.getAs[String]("id"),
-        row.getAs[String]("bid"),              // 新增带入
-        row.getAs[String]("user_id"),          // 带入用户ID
-        row.getAs[String]("screen_name"),      // 带入用户昵称
+        row.getAs[String]("bid"),
+        row.getAs[String]("user_id"),
+        row.getAs[String]("screen_name"),
         text,
         row.getAs[String]("topics"),
         row.getAs[Int]("reposts_count"),
@@ -186,10 +171,7 @@ object Classify {
         row.getAs[String]("user_authentication"),
         row.getAs[Int]("hour"),
         row.getAs[String]("time_period"),
-        label,
-        labelId,
-        score,
-        confidence,
+        label, labelId, score, confidence,
         row.getAs[String]("dt")
       )
     }.toDF(
@@ -200,22 +182,19 @@ object Classify {
       "label", "label_id", "score", "confidence", "dt"
     )
 
-    // 写入全新的预测结果表
-    writeDF.write
-      .mode("append")
-      .insertInto("weibo.predstatistic")
-    println(s"全新情感预测数据流写入完成！共写入 $count 条")
-    // 后续我们再将统计结果写入 mysql
+    writeDF.write.mode("append").insertInto("weibo.predstatistic")
+    println(s"情感预测写入完成，共写入 $cnt 条")
   }
 
-  // 计算数据写入hive
+
+  // 流式写入 Hive（classbydayandhour）
   def classByDayAndHour(spark: SparkSession, data: DataFrame): Unit = {
-    println("进入方法classByDayAndHour")
+    println("进入方法 classByDayAndHour")
     data.writeStream
       .foreachBatch { (batchDF: DataFrame, batchId: Long) =>
-        println(s"batchId = $batchId, count = ${batchDF.count()}")
+        println(s"batchId=$batchId, count=${batchDF.count()}")
         val df2 = batchDF
-          .withColumn("created_at", to_timestamp(col("created_at"), "yyyy-MM-dd HH:mm"))
+          .withColumn("created_at", org.apache.spark.sql.functions.to_timestamp(col("created_at"), "yyyy-MM-dd HH:mm"))
           .withColumn("hour", hour(col("created_at")))
           .withColumn("time_period",
             when(col("hour") < 6, "凌晨")
@@ -226,59 +205,37 @@ object Classify {
               .otherwise("午夜")
           )
           .withColumn("dt", date_format(col("created_at"), "yyyy-MM-dd"))
-          // 转换评论 转发 点赞为整数
-          .withColumn("reposts_count", col("reposts_count").cast("int"))
+          .withColumn("reposts_count",  col("reposts_count").cast("int"))
           .withColumn("comments_count", col("comments_count").cast("int"))
           .withColumn("attitudes_count", col("attitudes_count").cast("int"))
+
         val finalDF = df2.select(
-          "id","bid","user_id","screen_name","text","topics",
-          "reposts_count","comments_count","attitudes_count",
-          "created_at","location","user_authentication", "hour","time_period" ,"dt"
+          "id", "bid", "user_id", "screen_name", "text", "topics",
+          "reposts_count", "comments_count", "attitudes_count",
+          "created_at", "location", "user_authentication",
+          "hour", "time_period", "dt"
         )
 
-
-        // 写入hive
         try {
-          println("写入hive")
           if (!HiveTableExists.tableExists(spark, "weibo", "classbydayandhour")) {
-            println("表不存在")
             spark.sql(
               """
                 |CREATE TABLE IF NOT EXISTS weibo.classbydayandhour (
-                |   id                  STRING,
-                |   bid                 STRING,
-                |   user_id             STRING,
-                |   screen_name         STRING,
-                |   text                STRING,
-                |   topics              STRING,
-                |   reposts_count       INT,
-                |   comments_count      INT,
-                |   attitudes_count     INT,
-                |   created_at          TIMESTAMP,
-                |   location           STRING,
-                |   user_authentication STRING,
-                |   hour                INT,    -- 小时 0-23（你要的跨天统计用）
-                |   time_period         STRING  -- 深夜/早间/午间/下午/晚间
-                |)
-                |PARTITIONED BY (dt STRING)      -- 按天分区
-                |STORED AS PARQUET;
+                |   id STRING, bid STRING, user_id STRING, screen_name STRING,
+                |   text STRING, topics STRING,
+                |   reposts_count INT, comments_count INT, attitudes_count INT,
+                |   created_at TIMESTAMP, location STRING,
+                |   user_authentication STRING, hour INT, time_period STRING
+                |) PARTITIONED BY (dt STRING) STORED AS PARQUET
                 |""".stripMargin
             )
           }
-          finalDF.write.mode("append")
-            .insertInto("weibo.classbydayandhour")
+          finalDF.write.mode("append").insertInto("weibo.classbydayandhour")
           spark.sql("MSCK REPAIR TABLE weibo.classbydayandhour")
-
-//          finalDF.write
-//            .mode("append")
-//            .partitionBy("dt")
-//            .format("hive")
-//            .saveAsTable("weibo.classbydayandhour")
-
-          println("Hive写入成功")
-          ()
+          println("Hive 写入成功")
         } catch {
-          case e: Exception => println("写入hive失败")
+          case e: Exception =>
+            println("写入 Hive 失败")
             e.printStackTrace()
         }
       }
@@ -287,231 +244,144 @@ object Classify {
       .start()
   }
 
-  // 从hive读取数据聚合后（要去重聚合） 写入集群的mysql
+  // 聚合统计MySQL
   def classByIndicator(spark: SparkSession): Unit = {
-    // data 是流数据
-    println("进入方法classByIndicator")
-    val lit = org.apache.spark.sql.functions.lit _
-    // 判断表是否存在
-    val isExist = HiveTableExists.tableExists(spark, "weibo", "classbydayandhour")
-    if (!isExist) {
-      println("表不存在")
-      return
+    println("进入方法 classByIndicator")
+
+    if (!HiveTableExists.tableExists(spark, "weibo", "classbydayandhour")) {
+      println("classbydayandhour 表不存在"); return
     }
+
     val data = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "classbydayandhour")
-    data.localCheckpoint()
+    // 数据量大时允许溢写磁盘
+    data.persist(StorageLevel.MEMORY_AND_DISK)
 
-    // 获取当前时间
-    val now = java.time.LocalDateTime.now()
-    val nowStr = now.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-    // 统计各类用户的数量发帖 根据用户认证user_authentication
-    val userCount = data.groupBy("user_authentication").count()
-      .withColumn("create_time", lit(nowStr))
-    // 统计不同时间段的活跃度 time_period 午夜 ...
-    val timePeriodCount = data.groupBy("time_period").count()
-      .withColumn("create_time", lit(nowStr))
-    // 统计不同天的相同时段的活跃度 hour 23 0 10 ...
-    val timeHourCount = data.groupBy("hour").count().orderBy("hour")
-      // 添加时间字段
-      .withColumn("create_time", lit(nowStr)) // 添加时间字段
-    // 统计时序数据 dt
-    val timeSeriesCount = data.groupBy("dt").count().orderBy("dt")
-      .withColumn("create_time", lit(nowStr))
-    // 统计各个时段各类型用户的发帖数
-    val timePeriodUserCount = data.groupBy("time_period",
-      "user_authentication").count()
-      .withColumn("create_time", lit(nowStr))
-    // 统计各个地区的数量 间接得到热度
-    import org.apache.spark.sql.functions._
+    val nowStr = java.time.LocalDateTime.now()
+      .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
 
-
-    // 对regionCount的每个数值做
-    // 计算最大、最小值
-    val regionCount = data
+    val userCount         = data.groupBy("user_authentication").count().withColumn("create_time", lit(nowStr))
+    val timePeriodCount   = data.groupBy("time_period").count().withColumn("create_time", lit(nowStr))
+    val timeHourCount     = data.groupBy("hour").count().orderBy("hour").withColumn("create_time", lit(nowStr))
+    val timeSeriesCount   = data.groupBy("dt").count().orderBy("dt").withColumn("create_time", lit(nowStr))
+    val timePeriodUserCount = data.groupBy("time_period", "user_authentication").count().withColumn("create_time", lit(nowStr))
+    val regionCount       = data
       .filter(col("location").isNotNull && col("location") =!= "")
       .select(explode(split(col("location"), " \\| ")).as("region"))
       .filter(col("region").isNotNull && col("region") =!= "")
-      .groupBy("region")
-      .count()
-      .orderBy(desc("count"))
+      .groupBy("region").count().orderBy(desc("count"))
       .withColumn("create_time", lit(nowStr))
 
-    // 写入 MySQL
-    WriteMysql.writeTable(userCount, "user_post_count")
-    WriteMysql.writeTable(timePeriodCount, "time_period_count")
-    WriteMysql.writeTable(timeHourCount, "hour_post_count")
-    WriteMysql.writeTable(timeSeriesCount, "day_post_count")
+    WriteMysql.writeTable(userCount,           "user_post_count")
+    WriteMysql.writeTable(timePeriodCount,     "time_period_count")
+    WriteMysql.writeTable(timeHourCount,       "hour_post_count")
+    WriteMysql.writeTable(timeSeriesCount,     "day_post_count")
     WriteMysql.writeTable(timePeriodUserCount, "time_period_user_count")
-    WriteMysql.writeTable(regionCount, "regionHot")
+    WriteMysql.writeTable(regionCount,         "regionHot")
+
+    // 写完 classbydayandhour 相关统计后立即释放，再加载 predstatistic
     data.unpersist()
 
+    if (!HiveTableExists.tableExists(spark, "weibo", "predstatistic")) {
+      println("predstatistic 表不存在"); return
+    }
+
+    val preData = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "predstatistic")
+    // computeSentiment 和 computeUserPortrait 会多次扫描
+    preData.persist(StorageLevel.MEMORY_AND_DISK)
+
+    if (preData.isEmpty) { println("预测表为空"); preData.unpersist(); return }
 
     // 情感统计
-    println("情感统计")
-    // 读取weibo.predstatistic 表
-    val isExistPre = HiveTableExists.tableExists(spark, "weibo", "predstatistic")
-    if (!isExistPre) {
-      println("表不存在")
-      return
-    }
-    val preData = ReadHiveUtils.readHiveclassByDayAndHour(spark, "weibo", "predstatistic")
-    preData.localCheckpoint()
-    if (preData.head(1).isEmpty){
-      println("预测表为空")
-      return
-    }
+    computeSentiment(preData, nowStr)
 
-
-    // 用户画像模块
-    // 用户画像每天晚上统计一次
+    // 用户画像（定时窗口内才做，避免每次都跑重计算）
     import java.util.{Timer, TimerTask}
     val timer = new Timer(true)
-    timer.schedule(new TimerTask() {
+    timer.schedule(new TimerTask {
       override def run(): Unit = {
         try {
           val nowTime = LocalTime.now()
-          val today = LocalDate.now()
-          println(s"时间: ${nowTime.toString.take(8)} | 开始执行每10分钟常规统计...")
-          // 判断当前是否处于 23:00 到 23:59 之间
-          val startTimeBoundary = LocalTime.of(Constant.startHour, Constant.startMin)
-          val endTimeBoundary = LocalTime.of(Constant.endHour, Constant.endMin)
-
-          if (nowTime.isAfter(startTimeBoundary) && nowTime.isBefore(endTimeBoundary)) {
-              println(s"启动全量老用户画像")
-              // 执行全量画像重刷
-              computeUserPortrait(preData, nowStr)
-              println(s"今天 (${today}) 的夜间全量画像校准已顺利完成，状态锁已关闭。")
+          val start   = LocalTime.of(Constant.startHour, Constant.startMin)
+          val end     = LocalTime.of(Constant.endHour,   Constant.endMin)
+          if (nowTime.isAfter(start) && nowTime.isBefore(end)) {
+            println("启动全量用户画像")
+            computeUserPortrait(preData, nowStr)
+            println("夜间画像完成")
           }
         } catch {
           case e: Exception =>
-            println("本次统计出错，已自动跳过，等待下一个5分钟。错误详情：")
+            println("画像统计出错，跳过本次")
             e.printStackTrace()
         }
       }
-    }, 0, 1000 * 60 * 25) // 0秒后开始，每25分钟执行一次
+    }, 0, 1000 * 60 * 25)
 
-    // 情感数据
-    computeSentiment(preData, nowStr)
-
-    // 释放资源
+    // 画像任务是异步定时器，主线程在这里等足够的窗口期后再 unpersist
+    // 这里保守地等计算完后由调用方决定；当前保持 unpersist 在方法末尾
     preData.unpersist()
-
   }
 
 
+  // 情感统计模块
 
-  // 计算情感模块
   def computeSentiment(preData: DataFrame, nowStr: String): Unit = {
 
-    // 情感总体统计  情感类型分布（正面/负面/中性）
-    //select label, label_id, count(*) as cnt
-    //from weibo.predstatistic
-    //group by label, label_id
-
+    // 情感总体分布
     val labelCount = preData
-      .filter(col("label").isin("正面", "负面", "中性")) // 过滤非法值
-      .groupBy("label")
-      .count()
+      .filter(col("label").isin("正面", "负面", "中性"))
+      .groupBy("label").count()
       .withColumnRenamed("count", "value")
-      .withColumn("create_time", lit(nowStr)) // 加统计时间
+      .withColumn("create_time", lit(nowStr))
 
-    //时段 + 情感联动统计
-    //select time_period, label, count(*) as cnt
-    //from weibo.predstatistic
-    //group by time_period, label
+    // 时段 + 情感
     val labelCountByTime = preData
-      .groupBy("time_period", "label")
-      .count()
+      .groupBy("time_period", "label").count()
       .withColumnRenamed("count", "value")
-      .withColumn("create_time", lit(nowStr)) // 加统计时间
+      .withColumn("create_time", lit(nowStr))
 
-
-    // 用户类型（认证）与情感关系
-    //-- 不同认证用户的情感倾向
-    //select user_authentication, label, count(*) as cnt
-    //from weibo.predstatistic
-    //group by user_authentication, label
+    // 用户认证 + 情感
     val labelCountByUser = preData
-      .groupBy("user_authentication", "label")
-      .count()
+      .groupBy("user_authentication", "label").count()
       .withColumnRenamed("count", "value")
-      .withColumn("create_time", lit(nowStr)) // 加统计时间
+      .withColumn("create_time", lit(nowStr))
 
-    //帖子热度（转评赞）与情感关联
-    //-- 不同情感的平均转发/评论/点赞
-    //select label,
-    //       avg(reposts_count) as avg_repost,
-    //       avg(comments_count) as avg_comment,
-    //       avg(attitudes_count) as avg_attitude
-    //from weibo.predstatistic
-    //group by label
+    // 互动量 + 情感
     val interactionCountByLabel = preData
       .groupBy("label")
       .agg(
-        // 保留2位小数
-        round(avg("reposts_count"), 2).alias("avg_repost"),
+        round(avg("reposts_count"),  2).alias("avg_repost"),
         round(avg("comments_count"), 2).alias("avg_comment"),
-        round(avg("attitudes_count"), 2).alias("avg_attitude")
+        round(avg("attitudes_count"),2).alias("avg_attitude")
       )
-      .withColumn("create_time", lit(nowStr)) // 加统计时间
-
-
-    // 地区综合情感热度（平均分 score）
-    // 每个地区一个综合情感分数
-    // 同一个地区的所有微博的 score 加起来求平均值
-    // 从 -1 - 1   越大越好
-    val regionHeatStatistic = preData
-      // 过滤无效数据
-      .filter(col("location").isNotNull && col("location") =!= "")
-      .filter(col("score").isNotNull)
-      // 拆分多地区：例如 "北京|上海"  拆成两行
-      .select(
-        explode(split(col("location"), " \\| ")).as("region"),
-        col("score")
-      )
-      // 按地区分组 计算综合平均分+ 帖子数量
-      .groupBy("region")
-      .agg(
-        avg("score").as("avg_score"),        // 综合情感分数
-        count("*").as("count")              // 帖子数量
-      )
-      // 过滤掉数据太少的冷门地区，图表更干净
-      .filter(col("count") >= 5)
-      // 分数从高到低排序
-      .orderBy(desc("avg_score"))
-      // 添加统计时间
       .withColumn("create_time", lit(nowStr))
 
-    // 每日情感趋势 占比统计 无偏差
-    //  先算每日各类情感数量
+    // 地区综合情感热度
+    val regionHeatStatistic = preData
+      .filter(col("location").isNotNull && col("location") =!= "" && col("score").isNotNull)
+      .select(explode(split(col("location"), " \\| ")).as("region"), col("score"))
+      .filter(col("region").isNotNull && col("region") =!= "")
+      .groupBy("region")
+      .agg(avg("score").as("avg_score"), count("*").as("count"))
+      .filter(col("count") >= 5)
+      .orderBy(desc("avg_score"))
+      .withColumn("create_time", lit(nowStr))
+
+    // dayLabelCount 被两次用到，提前 persist 避免重复扫描 preData
     val dayLabelCount = preData
       .filter(col("label").isNotNull && col("label") =!= "")
-      .groupBy("dt", "label")
-      .count()
+      .groupBy("dt", "label").count()
       .withColumnRenamed("count", "value")
+      .persist(StorageLevel.MEMORY_AND_DISK)
 
-    //  再算每日总数量
-    val dayTotalCount = dayLabelCount
-      .groupBy("dt")
-      .agg(sum("value").as("total"))
+    val dayTotalCount = dayLabelCount.groupBy("dt").agg(sum("value").as("total"))
 
-    //  关联 计算占比
     val dayLabelRatio = dayLabelCount
       .join(dayTotalCount, "dt")
-      .withColumn("ratio", round(col("value") / col("total") * 100, 2)) // 占比 %
+      .withColumn("ratio", round(col("value") / col("total") * 100, 2))
       .withColumn("create_time", lit(nowStr))
       .orderBy("dt")
 
-
-    // 模型稳定性分析 模型置信度统计（模型效果展示）
-    //-- 模型预测置信度区间分布
-    //select case
-    //    when confidence >= 0.9 then '高置信'
-    //    when confidence >= 0.7 then '中置信'
-    //    else '低置信'
-    //end as level, count(*) as cnt
-    //from weibo.predstatistic
-    //group by level
+    // 置信度分布
     val confidenceLevelCount = preData
       .filter(col("confidence").isNotNull)
       .withColumn("level",
@@ -519,168 +389,134 @@ object Classify {
           .when(col("confidence") >= 0.7, "中置信")
           .otherwise("低置信")
       )
-      .groupBy("level")
-      .count()
+      .groupBy("level").count()
       .withColumnRenamed("count", "value")
       .withColumn("create_time", lit(nowStr))
 
-    WriteMysql.writeTable(labelCount, "label_count")
-    WriteMysql.writeTable(labelCountByTime, "label_count_by_time")
-    WriteMysql.writeTable(labelCountByUser, "user_auth_label_count")
-    WriteMysql.writeTable(interactionCountByLabel, "interaction_count_by_label")
-    WriteMysql.writeTable(regionHeatStatistic, "region_heat_statistic")
-    WriteMysql.writeTable(dayLabelRatio, "day_label_ratio")
-    WriteMysql.writeTable(confidenceLevelCount, "confidence_level_count")
+    WriteMysql.writeTable(labelCount,             "label_count")
+    WriteMysql.writeTable(labelCountByTime,       "label_count_by_time")
+    WriteMysql.writeTable(labelCountByUser,       "user_auth_label_count")
+    WriteMysql.writeTable(interactionCountByLabel,"interaction_count_by_label")
+    WriteMysql.writeTable(regionHeatStatistic,    "region_heat_statistic")
+    WriteMysql.writeTable(dayLabelRatio,          "day_label_ratio")
+    WriteMysql.writeTable(confidenceLevelCount,   "confidence_level_count")
 
-
+    // 写完后释放中间 persist
+    dayLabelCount.unpersist()
   }
 
-
-
-  // 计算用户画像
-  def computeUserPortrait(
-                           preData: DataFrame,
-                           nowStr: String
-                         ): Unit = {
-    import org.apache.spark.sql.functions._
-
+  // 用户画像模块
+  def computeUserPortrait(preData: DataFrame, nowStr: String): Unit = {
     println("正在计算用户画像")
 
-        println("正在构建用户画像核心指标，并写入 MySQL...")
-        import org.apache.spark.sql.expressions.Window
+    val userWindow = Window.partitionBy("user_id")
 
-        // 共用的用户窗口公用器，用于求各类 TOP 极值
-        val userWindow = Window.partitionBy("user_id")
+    // 时段基础统计  后续被三个衍生 DF 复用，持久化
+    val userPeriodStats = preData
+      .groupBy("user_id", "time_period")
+      .agg(
+        count("*").as("period_post_cnt"),
+        avg("score").as("period_avg_score")
+      )
+      .persist(StorageLevel.MEMORY_AND_DISK)
 
-//     用户画像
-//     用户时间行为与情绪波动画像表
-//     计算时段基础统计
-        val userPeriodStats = preData
-          .groupBy("user_id", "time_period")
-          .agg(
-            count("*").as("period_post_cnt"),
-            avg("score").as("period_avg_score")
-          )
+    // 一次开窗 算出三个时段偏好
+    val userPeriodTop3 = userPeriodStats
+      .withColumn("rank_post", row_number().over(userWindow.orderBy(desc("period_post_cnt"))))
+      .withColumn("rank_emo",  row_number().over(userWindow.orderBy(asc("period_avg_score"))))
+      .withColumn("rank_high", row_number().over(userWindow.orderBy(desc("period_avg_score"))))
+      .filter("rank_post = 1 or rank_emo = 1 or rank_high = 1")
+      .groupBy("user_id")
+      .agg(
+        max(when(col("rank_post") === 1, col("time_period"))).as("prefer_time_period"),
+        max(when(col("rank_emo")  === 1, col("time_period"))).as("emo_time_period"),
+        max(when(col("rank_high")=== 1, col("time_period"))).as("high_time_period")
+      )
 
-        // 找出最常发帖时段
-        val preferPeriodDF = userPeriodStats
-          .withColumn("rank", row_number().over(userWindow.orderBy(desc("period_post_cnt"))))
-          .filter(col("rank") === 1)
-          .select(col("user_id"), col("time_period").as("prefer_time_period"))
 
-        // 找出情绪最负面的时段 (score 越小越负面)
-        val emoPeriodDF = userPeriodStats
-          .withColumn("rank", row_number().over(userWindow.orderBy(asc("period_avg_score"))))
-          .filter(col("rank") === 1)
-          .select(col("user_id"), col("time_period").as("emo_time_period"))
+    val preferHourDF = preData
+      .groupBy("user_id", "hour").count()
+      .withColumn("rank", row_number().over(userWindow.orderBy(desc("count"))))
+      .filter(col("rank") === 1)
+      .select(col("user_id"), col("hour").as("prefer_hour"))
 
-        // 找出情绪最正面的时段 (score 越大越正面)
-        val highPeriodDF = userPeriodStats
-          .withColumn("rank", row_number().over(userWindow.orderBy(desc("period_avg_score"))))
-          .filter(col("rank") === 1)
-          .select(col("user_id"), col("time_period").as("high_time_period"))
+    val userGlobalTimeStats = preData
+      .groupBy("user_id")
+      .agg(
+        round(stddev_samp("score"), 4).as("hourly_sentiment_stddev"),
+        first("screen_name", ignoreNulls = true).as("screen_name"),
+        round(
+          sum(when(col("hour") >= 23 || col("hour") < 4, 1).otherwise(0)) / count("*"), 4
+        ).as("night_post_ratio")
+      )
 
-        // 找出最常发帖的小时 (0-23)
-        val preferHourDF = preData
-          .groupBy("user_id", "hour")
-          .count()
-          .withColumn("rank", row_number().over(userWindow.orderBy(desc("count"))))
-          .filter(col("rank") === 1)
-          .select(col("user_id"), col("hour").as("prefer_hour"))
+    // 只 join 一次
+    val userTimeProfileDF = userGlobalTimeStats
+      .join(userPeriodTop3,  Seq("user_id"), "left")
+      .join(preferHourDF,   Seq("user_id"), "left")
+      .withColumn("create_time", lit(nowStr))
+      .na.fill(0.0, Seq("hourly_sentiment_stddev"))
 
-        // 统计全局指标：波动标准差、最新昵称、深夜发帖比例
-        val userGlobalTimeStats = preData
-          .groupBy("user_id")
-          .agg(
-            round(stddev_samp("score"), 4).as("hourly_sentiment_stddev"),
-            first("screen_name", ignoreNulls = true).as("screen_name"),
-            round(
-              sum(when(col("hour") >= 23 || col("hour") < 4, 1).otherwise(0)) / count("*"),
-              4
-            ).as("night_post_ratio")
-          )
+    // 地域炸开 被两个衍生 DF 复用，持久化
+    val explodedUserRegionDF = preData
+      .filter(col("location").isNotNull && col("location") =!= "")
+      .select(
+        col("user_id"), col("score"),
+        explode(split(col("location"), " \\| ")).as("region")
+      )
+      .filter(col("region").isNotNull && col("region") =!= "")
+      .persist(StorageLevel.MEMORY_AND_DISK)
 
-        // 最终融合成时间情绪画像大表
-        val userTimeProfileDF = userGlobalTimeStats
-          .join(preferPeriodDF, Seq("user_id"), "left")
-          .join(preferHourDF, Seq("user_id"), "left")
-          .join(emoPeriodDF, Seq("user_id"), "left")
-          .join(highPeriodDF, Seq("user_id"), "left")
-          .withColumn("create_time", lit(nowStr))
-          .na.fill(0.0, Seq("hourly_sentiment_stddev")) // 防止单条发帖算不出标准差报 NaN
+    val userRegionGroupStats = explodedUserRegionDF
+      .groupBy("user_id", "region")
+      .agg(count("*").as("region_focus_count"), round(avg("score"), 4).as("top_region_avg_score"))
 
-        // 用户地域关注与情绪投射画像表
-        // 多标签炸开：处理一发多地的情况
-        val explodedUserRegionDF = preData
-          .filter(col("location").isNotNull && col("location") =!= "")
-          .select(
-            col("user_id"),
-            col("score"),
-            explode(split(col("location"), " \\| ")).as("region")
-          )
-          .filter(col("region").isNotNull && col("region") =!= "")
+    val topRegionDF = userRegionGroupStats
+      .withColumn("rank", row_number().over(Window.partitionBy("user_id").orderBy(desc("region_focus_count"))))
+      .filter(col("rank") === 1)
+      .select(
+        col("user_id"), col("region").as("top_focus_region"),
+        col("region_focus_count"), col("top_region_avg_score")
+      )
 
-        // 按 用户+地域 聚合
-        val userRegionGroupStats = explodedUserRegionDF
-          .groupBy("user_id", "region")
-          .agg(
-            count("*").as("region_focus_count"),
-            round(avg("score"), 4).as("top_region_avg_score")
-          )
+    val regionDiversityDF = explodedUserRegionDF
+      .groupBy("user_id")
+      .agg(countDistinct("region").as("region_diversity_score"))
 
-        // 筛选出最关注的 Top1 地域
-        val topRegionDF = userRegionGroupStats
-          .withColumn("rank", row_number().over(Window.partitionBy("user_id").orderBy(desc("region_focus_count"))))
-          .filter(col("rank") === 1)
-          .select(
-            col("user_id"),
-            col("region").as("top_focus_region"),
-            col("region_focus_count"),
-            col("top_region_avg_score")
-          )
+    val userRegionProfileDF = topRegionDF
+      .join(regionDiversityDF, Seq("user_id"), "left")
+      .withColumn("create_time", lit(nowStr))
 
-        // 计算地域关注的去重总数（离散度）
-        val regionDiversityDF = explodedUserRegionDF
-          .groupBy("user_id")
-          .agg(countDistinct("region").as("region_diversity_score"))
+    val userAuthProfileDF = preData
+      .groupBy("user_id")
+      .agg(
+        first("user_authentication", ignoreNulls = true).as("user_authentication"),
+        round(
+          sum(when(col("label") === "正面", col("reposts_count") + col("comments_count") + col("attitudes_count")).otherwise(0)) /
+            sum(when(col("label") === "正面", 1).otherwise(lit(1))), 2
+        ).as("pos_interaction_avg"),
+        round(
+          sum(when(col("label") === "负面", col("reposts_count") + col("comments_count") + col("attitudes_count")).otherwise(0)) /
+            sum(when(col("label") === "负面", 1).otherwise(lit(1))), 2
+        ).as("neg_interaction_avg"),
+        round(avg("confidence"), 4).as("avg_model_confidence")
+      )
+      .withColumn("sentiment_leverage",
+        round(col("neg_interaction_avg") / when(col("pos_interaction_avg") === 0, 1).otherwise(col("pos_interaction_avg")), 2)
+      )
+      .withColumn("is_official",
+        when(col("user_authentication").isNotNull && col("user_authentication") === "官方媒体(蓝V)", 1).otherwise(0)
+      )
+      .withColumn("create_time", lit(nowStr))
 
-        // 融合成地域画像表
-        val userRegionProfileDF = topRegionDF
-          .join(regionDiversityDF, Seq("user_id"), "left")
-          .withColumn("create_time", lit(nowStr))
+    WriteMysql.writeTable(userAuthProfileDF,   "user_auth_sentiment_profile")
+    WriteMysql.writeTable(userRegionProfileDF, "user_region_sentiment_profile")
+    WriteMysql.writeTable(userTimeProfileDF,   "user_time_sentiment_profile")
 
-        // 用户身份特征与传播情绪特质画像表
+    // 写完后释放中间 persist
+    userPeriodStats.unpersist()
+    explodedUserRegionDF.unpersist()
 
-        val isOfficialCondition = when(
-          col("user_authentication").isNotNull && col("user_authentication") === "官方媒体(蓝V)", 1
-        ).otherwise(0)
-        val userAuthProfileDF = preData
-          .groupBy("user_id")
-          .agg(
-            first("user_authentication", ignoreNulls = true).as("user_authentication"),
-            // 正面平均互动量
-            round(
-              sum(when(col("label") === "正面", col("reposts_count") + col("comments_count") + col("attitudes_count")).otherwise(0)) /
-                sum(when(col("label") === "正面", 1).otherwise(lit(1))), 2
-            ).as("pos_interaction_avg"),
-            // 负面平均互动量
-            round(
-              sum(when(col("label") === "负面", col("reposts_count") + col("comments_count") + col("attitudes_count")).otherwise(0)) /
-                sum(when(col("label") === "负面", 1).otherwise(lit(1))), 2
-            ).as("neg_interaction_avg"),
-            round(avg("confidence"), 4).as("avg_model_confidence")
-          )
-          // 计算情绪杠杆率
-          .withColumn("sentiment_leverage",
-            round(col("neg_interaction_avg") / when(col("pos_interaction_avg") === 0, 1).otherwise(col("pos_interaction_avg")), 2)
-          )
-          .withColumn("create_time", lit(nowStr))
-          .withColumn("is_official", isOfficialCondition)
-          .withColumn("create_time", lit(nowStr))
-
-        WriteMysql.writeTable(userAuthProfileDF, "user_auth_sentiment_profile")
-        WriteMysql.writeTable(userRegionProfileDF, "user_region_sentiment_profile")
-        WriteMysql.writeTable(userTimeProfileDF, "user_time_sentiment_profile")
-        println("用户画像核心指标全部顺利写入 MySQL！")
+    println("用户画像写入完成")
   }
 }

@@ -20,7 +20,7 @@ object WeiBoKafkaConsumer {
   def main(args: Array[String]): Unit = {
     val spark = SparkSession.builder()
       .appName("WeiBoKafkaConsumer")
-      .master("local[*]")
+      .master("local[16]")
       .enableHiveSupport()
       .config("hive.metastore.uris", "thrift://master1:9083")
       .config("spark.local.dir", "F:/spark-tmp")   //
@@ -42,12 +42,15 @@ object WeiBoKafkaConsumer {
     // 写入 Hive（流式，持续运行）
     Classify.classByDayAndHour(spark, data)
 
-    val timer = new Timer(true)
+
+
+    val timer1 = new Timer(true)
+    val timer2 = new Timer(true)
 
     //  任务1：常规统计 + 夜间画像，每 30 min 执行
     // delay=6s：等 Spark Streaming 启动完成后再跑，避免抢资源
     var lastRefreshDate: LocalDate = LocalDate.MIN
-    timer.schedule(new TimerTask() {
+    timer1.schedule(new TimerTask() {
       override def run(): Unit = {
         try {
           val nowTime = LocalTime.now()
@@ -77,13 +80,14 @@ object WeiBoKafkaConsumer {
           case e: Exception =>
             println("[统计任务] 本次出错，跳过：" + e.getMessage)
             e.printStackTrace()
+            // 无论画像跑没跑，定时器执行完才释放
         }
       }
-    }, 6 * 1000L, 10 * 60 * 1000L)  // delay=1min，每10min一次
+    }, 1 * 100L, 10 * 60 * 1000L)  // delay=1min，每10min一次
 
     // 任务2：推荐计算，每 30 min 执行
     // delay=3min：错开统计任务，避免两个任务同时启动争抢 Spark 资源
-    timer.schedule(new TimerTask() {
+    timer2.schedule(new TimerTask() {
       override def run(): Unit = {
         try {
           println("推荐任务开始执行...")
@@ -95,8 +99,14 @@ object WeiBoKafkaConsumer {
             e.printStackTrace()
         }
       }
-    }, 5 * 60 * 1000L, 30 * 60 * 1000L)  // delay=3min，每30min一次
+    }, 1 * 60 * 1000L, 30 * 60 * 1000L)  // delay=3min，每30min一次
 
+    sys.addShutdownHook {
+      println("正在关闭定时器...")
+      timer1.cancel()
+      timer2.cancel()
+      spark.stop()
+    }
     spark.streams.awaitAnyTermination()
   }
 
@@ -148,11 +158,6 @@ object WeiBoKafkaConsumer {
       .withColumn("reposts_count",  col("reposts_count").cast(IntegerType))
       .withColumn("comments_count", col("comments_count").cast(IntegerType))
       .withColumn("attitudes_count", col("attitudes_count").cast(IntegerType))
-      .filter(
-        col("reposts_count")  > 0 ||
-          col("comments_count") > 0 ||
-          col("attitudes_count") > 0
-      )
       .dropDuplicates("id")
   }
 }

@@ -98,22 +98,34 @@ object WeiboFinalPipeline {
     df.withColumn("words", jiebaUDF(col("text")))
   }
 
+
+
+
+
   // 特征工程
   object RuleFeatureBuilder {
     def build(df: DataFrame): DataFrame = {
       df
+        // 正文长度
         .withColumn("text_length", length(col("text")))
+        // 垃圾关键词数量
         .withColumn("spam_keyword_count", size(split(col("text"), "加V|抽奖|秒杀|代理|私信|领取|福利|红包|点击|下单|推广|包邮|免费|送|宝子|亲亲|抽|双11")))
+        // 推广数量
         .withColumn("engagement", col("reposts_count") + col("comments_count") + col("attitudes_count"))
+        // 推广占比
         .withColumn("engagement_ratio", col("engagement") / (length(col("text")) + 1))
+        // 推广关键词数量
         .withColumn("promotion_count", (length(col("text")) - length(regexp_replace(col("text"), "关注|转发|评论|点赞|进店|抢购|优惠|又好又便宜", ""))) / 8)
+        // 是否 互动度是不是高
         .withColumn("is_viral", when(col("reposts_count") > 1000, 1).otherwise(0))
+        // 互动度得分三者相加
         .withColumn("engagement_score", col("reposts_count") + col("comments_count") + col("attitudes_count"))
+        // 垃圾关键词的密度
         .withColumn("spam_density", col("spam_keyword_count") / (length(col("text")) + 1))
+        // 推广关键词的密度
         .withColumn("promotion_density", col("promotion_count") / (length(col("text")) + 1))
     }
   }
-
 
   // 简单测试正确率
   def simpleTestAccuracy(spark: SparkSession, model: PipelineModel,df:DataFrame): Unit = {

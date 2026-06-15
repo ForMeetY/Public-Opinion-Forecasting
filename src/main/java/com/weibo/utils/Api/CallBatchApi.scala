@@ -58,6 +58,8 @@ object CallBatchApi {
     resultMap.toMap
   }
 
+
+  // GMM 模型预测接口
   def batchGmmPredict(rows: List[org.apache.spark.sql.Row])
   : Map[String, (Int, Double, Double, Double, Double)] = {
 
@@ -108,8 +110,9 @@ object CallBatchApi {
   }
 
 
+  // 微博主题预测接口
   def batchTopicPredict(texts: List[String]): Map[String, (String, Int, Double)] = {
-    val apiUrl = "http://127.0.0.1:8001/predict"  // 你的分类模型接口端口，注意别和情感接口8000冲突
+    val apiUrl = "http://127.0.0.1:8001/predict"
     val httpClient = HttpClients.createDefault()
     val httpPost = new HttpPost(apiUrl)
     httpPost.setHeader("Content-Type", "application/json;charset=UTF-8")

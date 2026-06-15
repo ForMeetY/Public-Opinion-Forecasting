@@ -3,45 +3,13 @@ package com.weibo.etl.userPortrait
 import com.weibo.utils.Api.CallBatchApi
 import com.weibo.utils.mysqlUtils.WriteMysql
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.functions.{col, lit} // 常用基础组件单独引出
-
 
 /**
  * @author Xbx
  * @date 2026/5/29 21:12
- *
+ * 用户画像特征工程
  */
 object UserPortrait {
-//
-//  // 新增用户画像统计  （暂时不用）
-//  def newUserColdStartProfile(spark: SparkSession, currentBatchDF: DataFrame): Unit = {
-//    import spark.implicits._
-//    println("开始执行：新用户画像增量冷启动对比预测...")
-//
-//    // 获取当前系统时间，用于标记更新时间
-//    val nowStr = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-//
-//    // 提取当前批次中所有出现过的去重 user_id
-//    val batchUsers = currentBatchDF
-//      .filter(col("user_id").isNotNull && col("user_id") =!= "")
-//      .select("user_id")
-//      .distinct()
-//
-//    // 读取 Hive 画像总表中已经存在的所有历史老用户
-//    val existUsers = spark.table("weibo.user_final_gmm_profile").select("user_id")
-//
-//    // 使用 left_anti join 筛选出这批数据里“从未有过画像”的纯新用户 ID
-//    val newUsersToPredict = batchUsers.join(existUsers, Seq("user_id"), "left_anti").cache()
-//    val newUserCount = newUsersToPredict.count()
-//
-//    println(s"经比对，当前批次包含新发帖用户 ${batchUsers.count()} 人，其中纯新用户: $newUserCount 人")
-//
-//    if (newUserCount == 0) {
-//      println("暂无全新用户需要做冷启动画像，流程结束。")
-//      newUsersToPredict.unpersist()
-//      return
-//    }
-//  }
 
   // 进行全量用户的统计
   def fullUserProfile(spark: SparkSession): Unit = {
@@ -52,26 +20,15 @@ object UserPortrait {
     val nowStr = java.time.LocalDateTime.now()
       .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
 
+    // 微博统计表
     val predDF = spark.table("weibo.predstatistic").cache()
 
-
-    // 聚合5大特征
-    //    val feat12 = predDF
-    //      .groupBy("user_id")
-    //      .agg(
-    //        first("screen_name", ignoreNulls = true).as("screen_name"),
-    //        round(stddev_samp("score"), 4).as("hourly_sentiment_stddev"),
-    //        round(
-    //          sum(when(col("hour") >= 23 || col("hour") < 4, 1).otherwise(0)).cast("double") / count("*"), 4
-    //        ).as("night_post_ratio")
-    //      )
-    //      .na.fill(0.0, Seq("hourly_sentiment_stddev"))
-
+    // 12 指的是
     val feat12 = predDF
       .groupBy("user_id")
       .agg(
         first("screen_name", ignoreNulls = true).as("screen_name"),
-        //  把认证信息带下来，如果没有这个字段
+        //  把认证信息带下来
         first("user_authentication", ignoreNulls = true).as("user_authentication"),
         round(stddev_samp("score"), 4).as("hourly_sentiment_stddev"),
         round(
@@ -80,6 +37,7 @@ object UserPortrait {
       )
       .na.fill(0.0, Seq("hourly_sentiment_stddev"))
       .na.fill("普通用户", Seq("user_authentication"))
+
 
     val explodedRegion = predDF
       .filter(col("location").isNotNull && col("location") =!= "")
@@ -122,12 +80,8 @@ object UserPortrait {
         round(col("neg_avg") / when(col("pos_avg") === 0, lit(1.0)).otherwise(col("pos_avg")), 4))
       .select("user_id", "sentiment_leverage")
       .na.fill(0.0, Seq("sentiment_leverage"))
-    //
-    //    val featureDF = feat12
-    //      .join(feat34, Seq("user_id"), "left")
-    //      .join(feat5, Seq("user_id"), "left")
-    //      .na.fill(0.0)
-    //      .cache()
+
+
     val featureDF = feat12
       .join(feat34, Seq("user_id"), "left")
       .join(feat5, Seq("user_id"), "left")
