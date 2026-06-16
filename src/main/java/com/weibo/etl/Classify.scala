@@ -74,7 +74,6 @@ object Classify {
     println(s"待分类数据：$cnt 条")
     if (cnt == 0) { println("暂无新数据需要分类"); return }
 
-    // collect 前先 repartition 到合理分区数，避免单 Driver OOM
     val rows = needDF.repartition(10).collectAsList()
     import scala.collection.JavaConverters._
     val rowsScala = rows.asScala.toList

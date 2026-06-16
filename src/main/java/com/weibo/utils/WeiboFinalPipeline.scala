@@ -35,7 +35,7 @@ object WeiboFinalPipeline {
     val hashingTF = new HashingTF()
       .setInputCol("words")  // 输入：分词后的词语
       .setOutputCol("rawFeatures") // 输出：TF-IDF
-      .setNumFeatures(1000)   // 词表大小
+      .setNumFeatures(1500)   // 词表大小
 
     //
     val idf = new IDF()
@@ -54,7 +54,7 @@ object WeiboFinalPipeline {
       "engagement", "engagement_ratio"
     )
 
-    // 将特征和词向量进行特征融合
+    // 最终逻辑回归的输入 将特征和词向量进行特征融合
     val assembler = new VectorAssembler()
       .setInputCols(ruleFeatures :+ "tfidf_features") // 输入：特征和词向量
       .setOutputCol("final_features")// 压缩成一个向量
